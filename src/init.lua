@@ -145,6 +145,8 @@ function LightningBolt.new(Attachment0, Attachment1, PartCount)
 	self._DisabledTransparency = 1
 	self._StartT = clock()
 	self._RanNum = math.random() * 100
+	self._Destroyed = false
+	self._Dissipating = false
 	self._RefIndex = #ActiveBranches + 1
 
 	ActiveBranches[self._RefIndex] = self
@@ -153,17 +155,33 @@ function LightningBolt.new(Attachment0, Attachment1, PartCount)
 end
 
 function LightningBolt:Destroy()
-	ActiveBranches[self._RefIndex] = nil
+	--Can be reached more than once (owner, lifetime, DestroyDissipate, an error), but must only run once
+	if self._Destroyed then
+		return
+	end
+	self._Destroyed = true
+
+	--Only clear the slot if it still holds this bolt, as a newer bolt may have been given it
+	if ActiveBranches[self._RefIndex] == self then
+		ActiveBranches[self._RefIndex] = nil
+	end
 
 	for i = 1, #self._Parts do
 		LightningCache:ReturnPart(self._Parts[i])
 	end
+
+	--The returned parts may soon belong to another bolt, so don't keep hold of them
+	self._Parts = {}
 
 	self = nil
 end
 
 --Calls Destroy() after TimeLength seconds where a dissipating effect takes place in the meantime
 function LightningBolt:DestroyDissipate(TimeLength, Strength)
+	if self._Destroyed or self._Dissipating then
+		return
+	end
+
 	TimeLength = TimeLength or 0.2
 	Strength = Strength or 0.5
 	local DissipateStartT = clock()
@@ -173,7 +191,7 @@ function LightningBolt:DestroyDissipate(TimeLength, Strength)
 	local StartMinThick = self.MinThicknessMultiplier
 	local DissipateLoop
 
-	DissipateLoop = RunService.Heartbeat:Connect(function()
+	local function UpdateDissipate()
 		local TimeSinceDissipate = clock() - DissipateStartT
 		self.MinThicknessMultiplier = StartMinThick + (-2 - StartMinThick) * TimeSinceDissipate / TimeLength
 
@@ -187,16 +205,25 @@ function LightningBolt:DestroyDissipate(TimeLength, Strength)
 			self.MinRadius = self.MinRadius + (self.MaxRadius - self.MinRadius) * interp
 		else
 			--Destroy Bolt
-			local TimePassed = clock() - self._StartT
-			local Lifetime = (self.PulseLength + 1) / self.PulseSpeed
+			self:Destroy()
+		end
+	end
 
-			if TimePassed < Lifetime then --prevents Destroy()ing twice
+	self._Dissipating = true
+
+	DissipateLoop = RunService.Heartbeat:Connect(function()
+		if not self._Destroyed then
+			local Success, Traceback = xpcall(UpdateDissipate, debug.traceback)
+
+			if not Success then
+				warn("[LightningBolt] A bolt errored while dissipating and was destroyed:\n" .. tostring(Traceback))
 				self:Destroy()
 			end
+		end
 
-			--Disconnect Loop
+		--Disconnect Loop once the bolt is destroyed, whatever destroyed it (owner, lifetime, end of fade or an error)
+		if self._Destroyed then
 			DissipateLoop:Disconnect()
-			DissipateLoop = nil
 		end
 	end)
 end
@@ -272,81 +299,93 @@ function LightningBolt:_Disable()
 	end
 end
 
+--Updates one bolt for this frame
+local function UpdateBranch(ThisBranch)
+	if ThisBranch.Enabled == true then
+		ThisBranch._PartsHidden = false
+
+		--Extract important variables
+		local MinRadius, MaxRadius = ThisBranch.MinRadius, ThisBranch.MaxRadius
+		local Parts = ThisBranch._Parts
+		local PartsN = #Parts
+		local RanNum = ThisBranch._RanNum
+		local spd = ThisBranch.AnimationSpeed
+		local freq = ThisBranch.Frequency
+		local MinThick, MaxThick = ThisBranch.MinThicknessMultiplier, ThisBranch.MaxThicknessMultiplier
+		local TimePassed = clock() - ThisBranch._StartT
+		local SpaceCurveFunction, RadialProfileFunction =
+			ThisBranch.SpaceCurveFunction, ThisBranch.RadialProfileFunction
+		local Lifetime = (ThisBranch.PulseLength + 1) / ThisBranch.PulseSpeed
+
+		--Extract control points
+		local a0, a1, CurveSize0, CurveSize1 =
+			ThisBranch.Attachment0, ThisBranch.Attachment1, ThisBranch.CurveSize0, ThisBranch.CurveSize1
+		local p0, p1, p2, p3 = a0.WorldPosition, a0.WorldPosition
+			+ a0.WorldAxis * CurveSize0, a1.WorldPosition
+			- a1.WorldAxis * CurveSize1, a1.WorldPosition
+
+		--Initialise iterative scheme for generating points along space curve
+		local init = SpaceCurveFunction(0, p0, p1, p2, p3)
+		local PrevPoint, bezier0 = init, init
+
+		--Update
+		if TimePassed < Lifetime then
+			for i = 1, PartsN do
+				local BPart = Parts[i]
+				local PercentAlongBolt = i / PartsN
+
+				--Compute noisy inputs
+				local input, input2 = (spd * -TimePassed)
+					+ freq * 10 * PercentAlongBolt
+					- 0.2
+					+ RanNum * 4, 5 * ((spd * 0.01 * -TimePassed) / 10 + freq * PercentAlongBolt)
+					+ RanNum * 4
+				local noise0 = NoiseBetween(5 * input, 1.5, 5 * 0.2 * input2, 0, 0.1 * 2 * math.pi)
+					+ NoiseBetween(0.5 * input, 1.5, 0.5 * 0.2 * input2, 0, 0.9 * 2 * math.pi)
+				local noise1 = NoiseBetween(3.4, input2, input, MinRadius, MaxRadius)
+					* RadialProfileFunction(PercentAlongBolt)
+				local thicknessNoise = NoiseBetween(2.3, input2, input, MinThick, MaxThick)
+
+				--Find next point along space curve
+				local bezier1 = SpaceCurveFunction(PercentAlongBolt, p0, p1, p2, p3)
+
+				--Find next point along bolt
+				local NextPoint = i ~= PartsN
+						and (CFrame.new(bezier0, bezier1) * CFrame.Angles(0, 0, noise0) * CFrame.Angles(
+						math.acos(math.clamp(NoiseBetween(input2, input, 2.7, offsetAngle, 1), -1, 1)),
+						0,
+						0
+					) * CFrame.new(0, 0, -noise1)).Position
+					or bezier1
+
+				ThisBranch:_UpdateGeometry(BPart, PercentAlongBolt, TimePassed, thicknessNoise, PrevPoint, NextPoint)
+
+				ThisBranch:_UpdateColor(BPart, PercentAlongBolt, TimePassed)
+
+				PrevPoint, bezier0 = NextPoint, bezier1
+			end
+		else
+			ThisBranch:Destroy()
+		end
+	else --Enabled = false
+		if ThisBranch._PartsHidden == false then
+			ThisBranch._PartsHidden = true
+			ThisBranch:_Disable()
+		end
+	end
+end
+
 RunService.Heartbeat:Connect(function()
 	debug.profilebegin("LightningBolt") --Create performance profile
 
 	for _, ThisBranch in pairs(ActiveBranches) do
-		if ThisBranch.Enabled == true then
-			ThisBranch._PartsHidden = false
+		--Guard each bolt so one that errors can't stop the others from updating
+		local Success, Traceback = xpcall(UpdateBranch, debug.traceback, ThisBranch)
 
-			--Extract important variables
-			local MinRadius, MaxRadius = ThisBranch.MinRadius, ThisBranch.MaxRadius
-			local Parts = ThisBranch._Parts
-			local PartsN = #Parts
-			local RanNum = ThisBranch._RanNum
-			local spd = ThisBranch.AnimationSpeed
-			local freq = ThisBranch.Frequency
-			local MinThick, MaxThick = ThisBranch.MinThicknessMultiplier, ThisBranch.MaxThicknessMultiplier
-			local TimePassed = clock() - ThisBranch._StartT
-			local SpaceCurveFunction, RadialProfileFunction =
-				ThisBranch.SpaceCurveFunction, ThisBranch.RadialProfileFunction
-			local Lifetime = (ThisBranch.PulseLength + 1) / ThisBranch.PulseSpeed
-
-			--Extract control points
-			local a0, a1, CurveSize0, CurveSize1 =
-				ThisBranch.Attachment0, ThisBranch.Attachment1, ThisBranch.CurveSize0, ThisBranch.CurveSize1
-			local p0, p1, p2, p3 = a0.WorldPosition, a0.WorldPosition
-				+ a0.WorldAxis * CurveSize0, a1.WorldPosition
-				- a1.WorldAxis * CurveSize1, a1.WorldPosition
-
-			--Initialise iterative scheme for generating points along space curve
-			local init = SpaceCurveFunction(0, p0, p1, p2, p3)
-			local PrevPoint, bezier0 = init, init
-
-			--Update
-			if TimePassed < Lifetime then
-				for i = 1, PartsN do
-					local BPart = Parts[i]
-					local PercentAlongBolt = i / PartsN
-
-					--Compute noisy inputs
-					local input, input2 = (spd * -TimePassed)
-						+ freq * 10 * PercentAlongBolt
-						- 0.2
-						+ RanNum * 4, 5 * ((spd * 0.01 * -TimePassed) / 10 + freq * PercentAlongBolt)
-						+ RanNum * 4
-					local noise0 = NoiseBetween(5 * input, 1.5, 5 * 0.2 * input2, 0, 0.1 * 2 * math.pi)
-						+ NoiseBetween(0.5 * input, 1.5, 0.5 * 0.2 * input2, 0, 0.9 * 2 * math.pi)
-					local noise1 = NoiseBetween(3.4, input2, input, MinRadius, MaxRadius)
-						* RadialProfileFunction(PercentAlongBolt)
-					local thicknessNoise = NoiseBetween(2.3, input2, input, MinThick, MaxThick)
-
-					--Find next point along space curve
-					local bezier1 = SpaceCurveFunction(PercentAlongBolt, p0, p1, p2, p3)
-
-					--Find next point along bolt
-					local NextPoint = i ~= PartsN
-							and (CFrame.new(bezier0, bezier1) * CFrame.Angles(0, 0, noise0) * CFrame.Angles(
-							math.acos(math.clamp(NoiseBetween(input2, input, 2.7, offsetAngle, 1), -1, 1)),
-							0,
-							0
-						) * CFrame.new(0, 0, -noise1)).Position
-						or bezier1
-
-					ThisBranch:_UpdateGeometry(BPart, PercentAlongBolt, TimePassed, thicknessNoise, PrevPoint, NextPoint)
-
-					ThisBranch:_UpdateColor(BPart, PercentAlongBolt, TimePassed)
-
-					PrevPoint, bezier0 = NextPoint, bezier1
-				end
-			else
-				ThisBranch:Destroy()
-			end
-		else --Enabled = false
-			if ThisBranch._PartsHidden == false then
-				ThisBranch._PartsHidden = true
-				ThisBranch:_Disable()
-			end
+		if not Success then
+			--A broken bolt would only error again every frame, so warn once and destroy it
+			warn("[LightningBolt] A bolt errored while updating and was destroyed:\n" .. tostring(Traceback))
+			ThisBranch:Destroy()
 		end
 	end
 
